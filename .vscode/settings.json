@@ -6,5 +6,19 @@
   "files.associations": {
     "*.h": "c",
     "*.c": "c"
-  }
+  },
+  "idf.currentSetup": "C:\\esp\\v5.5.4\\esp-idf",
+  "terminal.integrated.profiles.windows": {
+    "ESP-IDF PowerShell": {
+      "source": "PowerShell",
+      "args": [
+        "-NoExit",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-Command",
+        ". 'C:\\esp\\v5.5.4\\esp-idf\\export.ps1'; Set-Location -LiteralPath '${workspaceFolder}'"
+      ]
+    }
+  },
+  "terminal.integrated.defaultProfile.windows": "ESP-IDF PowerShell"
 }
