@@ -1,0 +1,57 @@
+menu "ESP32 IPphone"
+
+    menu "Keypad pins"
+        config IPPHONE_KEYPAD_ROW0
+            int "Keypad row 0 GPIO"
+            default 13
+        config IPPHONE_KEYPAD_ROW1
+            int "Keypad row 1 GPIO"
+            default 12
+        config IPPHONE_KEYPAD_ROW2
+            int "Keypad row 2 GPIO"
+            default 14
+        config IPPHONE_KEYPAD_ROW3
+            int "Keypad row 3 GPIO"
+            default 27
+        config IPPHONE_KEYPAD_COL0
+            int "Keypad column 0 GPIO"
+            default 26
+        config IPPHONE_KEYPAD_COL1
+            int "Keypad column 1 GPIO"
+            default 25
+        config IPPHONE_KEYPAD_COL2
+            int "Keypad column 2 GPIO"
+            default 33
+        config IPPHONE_KEYPAD_COL3
+            int "Keypad column 3 GPIO"
+            default 32
+    endmenu
+
+    menu "I2S audio pins"
+        config IPPHONE_I2S_BCLK
+            int "I2S BCLK GPIO"
+            default 18
+        config IPPHONE_I2S_WS
+            int "I2S WS/LRCLK GPIO"
+            default 19
+        config IPPHONE_I2S_DOUT
+            int "I2S data out GPIO"
+            default 22
+        config IPPHONE_I2S_DIN
+            int "I2S data in GPIO"
+            default 23
+        config IPPHONE_I2S_SAMPLE_RATE
+            int "I2S sample rate"
+            default 16000
+    endmenu
+
+    menu "Display pins"
+        config IPPHONE_I2C_SDA
+            int "I2C SDA GPIO"
+            default 21
+        config IPPHONE_I2C_SCL
+            int "I2C SCL GPIO"
+            default 4
+    endmenu
+
+endmenu
