@@ -1,6 +1,4 @@
 {
-  "idf.espIdfPathWin": "${env:IDF_PATH}",
-  "idf.toolsPathWin": "${env:IDF_TOOLS_PATH}",
   "idf.portWin": "COM3",
   "idf.flashType": "UART",
   "idf.adapterTargetName": "esp32",
