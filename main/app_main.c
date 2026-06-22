@@ -16,11 +16,9 @@ void app_main(void)
     ESP_ERROR_CHECK(network_audio_init());
 
     ESP_ERROR_CHECK(audio_play_test_tone());
-    ESP_ERROR_CHECK(audio_start_input_test());
 
     display_set_status("Готов");
-    ESP_LOGI(TAG, "Проверка: хлопните рядом с микрофоном и смотрите mic level в мониторе");
-    ESP_LOGI(TAG, "Этап 1: нажмите кнопку на клавиатуре 4x4");
+    ESP_LOGI(TAG, "Нажмите любую кнопку: ESP32 запишет 3 секунды голоса и проиграет запись");
 
     while (true) {
         char key = 0;
@@ -28,6 +26,12 @@ void app_main(void)
         if (err == ESP_OK && key != 0) {
             ESP_LOGI(TAG, "Нажата кнопка: %c", key);
             display_set_dialed_key(key);
+            display_set_status("Запись");
+            esp_err_t audio_err = audio_record_and_playback_test(3000);
+            if (audio_err != ESP_OK) {
+                ESP_LOGE(TAG, "Ошибка аудиотеста: %s", esp_err_to_name(audio_err));
+            }
+            display_set_status("Готов");
         }
 
         vTaskDelay(pdMS_TO_TICKS(10));
