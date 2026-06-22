@@ -28,18 +28,24 @@ menu "ESP32 IPphone"
     endmenu
 
     menu "I2S audio pins"
-        config IPPHONE_I2S_BCLK
-            int "I2S BCLK GPIO"
+        config IPPHONE_I2S_MIC_BCLK
+            int "Microphone I2S SCK/BCLK GPIO"
             default 18
-        config IPPHONE_I2S_WS
-            int "I2S WS/LRCLK GPIO"
+        config IPPHONE_I2S_MIC_WS
+            int "Microphone I2S WS GPIO"
             default 19
-        config IPPHONE_I2S_DOUT
-            int "I2S data out GPIO"
-            default 22
-        config IPPHONE_I2S_DIN
-            int "I2S data in GPIO"
+        config IPPHONE_I2S_MIC_DIN
+            int "Microphone I2S data in GPIO"
             default 23
+        config IPPHONE_I2S_SPK_BCLK
+            int "Speaker amp I2S BCLK GPIO"
+            default 5
+        config IPPHONE_I2S_SPK_WS
+            int "Speaker amp I2S LRC/LRCLK GPIO"
+            default 17
+        config IPPHONE_I2S_SPK_DOUT
+            int "Speaker amp I2S data out GPIO"
+            default 22
         config IPPHONE_I2S_SAMPLE_RATE
             int "I2S sample rate"
             default 16000

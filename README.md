@@ -50,3 +50,30 @@ idf.py -p COMx flash monitor
 - `Component config -> ESP32 IPphone -> Display pins`
 
 Перед подключением железа проверьте, что выбранные GPIO подходят вашей конкретной плате ESP32.
+
+### I2S подключение по умолчанию
+
+Микрофон INMP441:
+
+| INMP441 | ESP32 |
+| --- | --- |
+| `VDD` | `3V3` |
+| `GND` | `GND` |
+| `SCK` | `GPIO18` |
+| `WS` | `GPIO19` |
+| `SD` | `GPIO23` |
+| `L/R` | `GND` |
+
+Усилитель MAX98357A:
+
+| MAX98357A | ESP32 |
+| --- | --- |
+| `VIN` | `5V` или `3V3` |
+| `GND` | `GND` |
+| `BCLK` | `GPIO5` |
+| `LRC` / `LRCLK` | `GPIO17` |
+| `DIN` | `GPIO22` |
+| `SD` / `SHDN` | `3V3` или не подключать |
+| `GAIN` | не подключать |
+
+Динамик подключается только к `OUT+` и `OUT-` усилителя MAX98357A.
