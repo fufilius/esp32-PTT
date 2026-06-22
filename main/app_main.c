@@ -15,7 +15,11 @@ void app_main(void)
     ESP_ERROR_CHECK(display_init());
     ESP_ERROR_CHECK(network_audio_init());
 
+    ESP_ERROR_CHECK(audio_play_test_tone());
+    ESP_ERROR_CHECK(audio_start_input_test());
+
     display_set_status("Готов");
+    ESP_LOGI(TAG, "Проверка: хлопните рядом с микрофоном и смотрите mic level в мониторе");
     ESP_LOGI(TAG, "Этап 1: нажмите кнопку на клавиатуре 4x4");
 
     while (true) {
