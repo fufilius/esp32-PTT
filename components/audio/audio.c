@@ -1,4 +1,4 @@
-#include "audio.h"
+﻿#include "audio.h"
 
 #include <math.h>
 #include <stdbool.h>
@@ -23,7 +23,7 @@ static bool s_audio_busy;
 #define SPEAKER_AMPLITUDE 9000
 #define AUDIO_PI 3.14159265358979323846f
 #define RECORD_PLAYBACK_MS 3000
-#define MIC_TO_SPEAKER_SHIFT 14
+#define MIC_TO_SPEAKER_SHIFT 12
 
 static int16_t mic_sample_to_speaker_sample(int32_t mic_sample)
 {
@@ -117,7 +117,7 @@ esp_err_t audio_init(void)
 
 esp_err_t audio_start_input_test(void)
 {
-    ESP_LOGI(TAG, "input level test is disabled; press a keypad button to record and play voice");
+    ESP_LOGI(TAG, "input level test is disabled; press BOOT to record and play voice");
     return ESP_OK;
 }
 
@@ -166,70 +166,157 @@ esp_err_t audio_record_and_playback_test(uint32_t duration_ms)
 
     const size_t sample_count = ((size_t)CONFIG_IPPHONE_I2S_SAMPLE_RATE * duration_ms) / 1000;
     int16_t *recorded = (int16_t *)calloc(sample_count, sizeof(recorded[0]));
-    int32_t *mic_chunk = (int32_t *)calloc(MIC_READ_SAMPLES, sizeof(mic_chunk[0]));
-    if (recorded == NULL || mic_chunk == NULL) {
-        free(mic_chunk);
+    if (recorded == NULL) {
         free(recorded);
         ESP_LOGE(TAG, "record buffer allocation failed");
         return ESP_ERR_NO_MEM;
     }
 
-    s_audio_busy = true;
-    esp_err_t err = ESP_OK;
     ESP_LOGI(TAG, "recording voice for %lu ms (%u samples)", (unsigned long)duration_ms, (unsigned)sample_count);
-    err = i2s_channel_enable(s_mic_rx_chan);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "enable mic rx failed: %s", esp_err_to_name(err));
-        goto cleanup;
-    }
-
-    size_t samples_recorded = 0;
     int32_t peak = 0;
-
-    while (samples_recorded < sample_count) {
-        size_t bytes_read = 0;
-        err = i2s_channel_read(s_mic_rx_chan, mic_chunk, MIC_READ_SAMPLES * sizeof(mic_chunk[0]), &bytes_read, pdMS_TO_TICKS(1000));
-        if (err != ESP_OK) {
-            ESP_LOGE(TAG, "mic read failed: %s", esp_err_to_name(err));
-            goto cleanup_mic_enabled;
-        }
-
-        const size_t samples_read = bytes_read / sizeof(mic_chunk[0]);
-        for (size_t i = 0; i < samples_read && samples_recorded < sample_count; ++i) {
-            const int16_t sample = mic_sample_to_speaker_sample(mic_chunk[i]);
-            const int32_t abs_sample = abs(sample);
-            if (abs_sample > peak) {
-                peak = abs_sample;
-            }
-            recorded[samples_recorded++] = sample;
-        }
-    }
-
-cleanup_mic_enabled:
-    i2s_channel_disable(s_mic_rx_chan);
+    esp_err_t err = audio_record_samples(recorded, sample_count, &peak);
     if (err != ESP_OK) {
-        goto cleanup;
+        free(recorded);
+        ESP_RETURN_ON_ERROR(err, TAG, "record/playback failed");
     }
 
     ESP_LOGI(TAG, "record complete, peak=%ld; playing back", peak);
-    err = i2s_channel_enable(s_spk_tx_chan);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "enable speaker tx failed: %s", esp_err_to_name(err));
-        goto cleanup;
-    }
-
-    err = speaker_write_samples(recorded, samples_recorded);
-    esp_err_t disable_err = i2s_channel_disable(s_spk_tx_chan);
-    if (err == ESP_OK) {
-        err = disable_err;
-    }
-
-cleanup:
-    free(mic_chunk);
+    err = audio_play_samples(recorded, sample_count);
     free(recorded);
-    s_audio_busy = false;
 
     ESP_RETURN_ON_ERROR(err, TAG, "record/playback failed");
     ESP_LOGI(TAG, "record/playback test complete");
     return ESP_OK;
+}
+
+esp_err_t audio_record_samples(int16_t *samples, size_t sample_count, int32_t *peak)
+{
+    ESP_RETURN_ON_FALSE(s_mic_rx_chan != NULL, ESP_ERR_INVALID_STATE, TAG, "mic rx channel is not initialized");
+    ESP_RETURN_ON_FALSE(samples != NULL, ESP_ERR_INVALID_ARG, TAG, "record samples buffer is null");
+
+    int32_t local_peak = 0;
+    esp_err_t err = audio_mic_start();
+    ESP_RETURN_ON_ERROR(err, TAG, "start mic failed");
+
+    size_t samples_recorded = 0;
+    while (samples_recorded < sample_count) {
+        size_t samples_read = 0;
+        int32_t chunk_peak = 0;
+        err = audio_mic_read(&samples[samples_recorded], sample_count - samples_recorded, &samples_read, &chunk_peak);
+        if (err != ESP_OK) {
+            break;
+        }
+
+        samples_recorded += samples_read;
+        if (chunk_peak > local_peak) {
+            local_peak = chunk_peak;
+        }
+    }
+
+    esp_err_t disable_err = audio_mic_stop();
+    if (err == ESP_OK) {
+        err = disable_err;
+    }
+
+    if (peak != NULL) {
+        *peak = local_peak;
+    }
+    return err;
+}
+
+esp_err_t audio_play_samples(const int16_t *samples, size_t sample_count)
+{
+    ESP_RETURN_ON_FALSE(s_spk_tx_chan != NULL, ESP_ERR_INVALID_STATE, TAG, "speaker tx channel is not initialized");
+    ESP_RETURN_ON_FALSE(samples != NULL, ESP_ERR_INVALID_ARG, TAG, "play samples buffer is null");
+
+    esp_err_t err = audio_speaker_start();
+    ESP_RETURN_ON_ERROR(err, TAG, "start speaker failed");
+
+    err = audio_speaker_write(samples, sample_count);
+    esp_err_t disable_err = audio_speaker_stop();
+    if (err == ESP_OK) {
+        err = disable_err;
+    }
+
+    return err;
+}
+
+esp_err_t audio_mic_start(void)
+{
+    ESP_RETURN_ON_FALSE(s_mic_rx_chan != NULL, ESP_ERR_INVALID_STATE, TAG, "mic rx channel is not initialized");
+    ESP_RETURN_ON_FALSE(!s_audio_busy, ESP_ERR_INVALID_STATE, TAG, "audio is busy");
+
+    s_audio_busy = true;
+    esp_err_t err = i2s_channel_enable(s_mic_rx_chan);
+    if (err != ESP_OK) {
+        s_audio_busy = false;
+        ESP_LOGE(TAG, "enable mic rx failed: %s", esp_err_to_name(err));
+    }
+    return err;
+}
+
+esp_err_t audio_mic_read(int16_t *samples, size_t sample_capacity, size_t *samples_read, int32_t *peak)
+{
+    ESP_RETURN_ON_FALSE(samples != NULL, ESP_ERR_INVALID_ARG, TAG, "mic samples buffer is null");
+    ESP_RETURN_ON_FALSE(sample_capacity > 0, ESP_ERR_INVALID_ARG, TAG, "mic samples capacity is zero");
+    ESP_RETURN_ON_FALSE(s_audio_busy, ESP_ERR_INVALID_STATE, TAG, "mic is not started");
+
+    int32_t mic_chunk[MIC_READ_SAMPLES] = {0};
+    const size_t samples_to_read = sample_capacity < MIC_READ_SAMPLES ? sample_capacity : MIC_READ_SAMPLES;
+
+    size_t bytes_read = 0;
+    esp_err_t err =
+        i2s_channel_read(s_mic_rx_chan, mic_chunk, samples_to_read * sizeof(mic_chunk[0]), &bytes_read, pdMS_TO_TICKS(1000));
+    ESP_RETURN_ON_ERROR(err, TAG, "mic read failed");
+
+    const size_t read_count = bytes_read / sizeof(mic_chunk[0]);
+    int32_t local_peak = 0;
+    for (size_t i = 0; i < read_count; ++i) {
+        const int16_t sample = mic_sample_to_speaker_sample(mic_chunk[i]);
+        const int32_t abs_sample = abs(sample);
+        if (abs_sample > local_peak) {
+            local_peak = abs_sample;
+        }
+        samples[i] = sample;
+    }
+
+    if (samples_read != NULL) {
+        *samples_read = read_count;
+    }
+    if (peak != NULL) {
+        *peak = local_peak;
+    }
+    return ESP_OK;
+}
+
+esp_err_t audio_mic_stop(void)
+{
+    ESP_RETURN_ON_FALSE(s_mic_rx_chan != NULL, ESP_ERR_INVALID_STATE, TAG, "mic rx channel is not initialized");
+    ESP_RETURN_ON_FALSE(s_audio_busy, ESP_ERR_INVALID_STATE, TAG, "mic is not started");
+
+    esp_err_t err = i2s_channel_disable(s_mic_rx_chan);
+    s_audio_busy = false;
+    return err;
+}
+
+esp_err_t audio_speaker_start(void)
+{
+    ESP_RETURN_ON_FALSE(s_spk_tx_chan != NULL, ESP_ERR_INVALID_STATE, TAG, "speaker tx channel is not initialized");
+    esp_err_t err = i2s_channel_enable(s_spk_tx_chan);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "enable speaker tx failed: %s", esp_err_to_name(err));
+    }
+    return err;
+}
+
+esp_err_t audio_speaker_write(const int16_t *samples, size_t sample_count)
+{
+    ESP_RETURN_ON_FALSE(samples != NULL, ESP_ERR_INVALID_ARG, TAG, "speaker samples buffer is null");
+    return speaker_write_samples(samples, sample_count);
+}
+
+esp_err_t audio_speaker_stop(void)
+{
+    ESP_RETURN_ON_FALSE(s_spk_tx_chan != NULL, ESP_ERR_INVALID_STATE, TAG, "speaker tx channel is not initialized");
+    return i2s_channel_disable(s_spk_tx_chan);
 }
