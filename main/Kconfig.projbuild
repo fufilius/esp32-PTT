@@ -1,5 +1,9 @@
 menu "ESP32 IPphone"
 
+    config IPPHONE_BOOT_BUTTON_GPIO
+        int "On-board BOOT button GPIO"
+        default 0
+
     menu "Keypad pins"
         config IPPHONE_KEYPAD_ROW0
             int "Keypad row 0 GPIO"
@@ -58,6 +62,23 @@ menu "ESP32 IPphone"
         config IPPHONE_I2C_SCL
             int "I2C SCL GPIO"
             default 4
+    endmenu
+
+    menu "Status LED pins"
+        config IPPHONE_LED_GREEN_GPIO
+            int "Green status LED GPIO"
+            default 2
+        config IPPHONE_LED_GREEN_ACTIVE_LEVEL
+            int "Green status LED active level"
+            range 0 1
+            default 1
+        config IPPHONE_LED_RED_GPIO
+            int "Red voice activity LED GPIO"
+            default 16
+        config IPPHONE_LED_RED_ACTIVE_LEVEL
+            int "Red voice activity LED active level"
+            range 0 1
+            default 1
     endmenu
 
 endmenu
