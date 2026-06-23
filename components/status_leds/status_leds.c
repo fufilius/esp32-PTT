@@ -5,11 +5,14 @@
 #include "driver/gpio.h"
 #include "esp_check.h"
 #include "esp_log.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
 
 static const char *TAG = "status_leds";
 
 static bool s_tx_active;
 static bool s_rx_active;
+static SemaphoreHandle_t s_led_mutex;
 
 static uint32_t led_level(bool on, int active_level)
 {
@@ -27,6 +30,9 @@ static void status_leds_apply(void)
 
 esp_err_t status_leds_init(void)
 {
+    s_led_mutex = xSemaphoreCreateMutex();
+    ESP_RETURN_ON_FALSE(s_led_mutex != NULL, ESP_ERR_NO_MEM, TAG, "create led mutex failed");
+
     gpio_config_t cfg = {
         .pin_bit_mask = (1ULL << CONFIG_IPPHONE_LED_GREEN_GPIO) | (1ULL << CONFIG_IPPHONE_LED_RED_GPIO),
         .mode = GPIO_MODE_OUTPUT,
@@ -52,12 +58,34 @@ esp_err_t status_leds_init(void)
 
 void status_leds_set_tx(bool active)
 {
+    bool locked = false;
+    if (s_led_mutex != NULL) {
+        locked = xSemaphoreTake(s_led_mutex, portMAX_DELAY) == pdTRUE;
+        if (!locked) {
+            ESP_LOGE(TAG, "take led mutex failed");
+            return;
+        }
+    }
     s_tx_active = active;
     status_leds_apply();
+    if (locked) {
+        xSemaphoreGive(s_led_mutex);
+    }
 }
 
 void status_leds_set_rx(bool active)
 {
+    bool locked = false;
+    if (s_led_mutex != NULL) {
+        locked = xSemaphoreTake(s_led_mutex, portMAX_DELAY) == pdTRUE;
+        if (!locked) {
+            ESP_LOGE(TAG, "take led mutex failed");
+            return;
+        }
+    }
     s_rx_active = active;
     status_leds_apply();
+    if (locked) {
+        xSemaphoreGive(s_led_mutex);
+    }
 }

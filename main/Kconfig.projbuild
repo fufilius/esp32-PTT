@@ -1,8 +1,20 @@
 menu "ESP32 IPphone"
 
-    config IPPHONE_BOOT_BUTTON_GPIO
-        int "On-board BOOT button GPIO"
-        default 0
+    menu "Main button"
+        config IPPHONE_BUTTON_GPIO
+            int "Main button GPIO"
+            default 0
+        config IPPHONE_BUTTON_ACTIVE_LEVEL
+            int "Main button active level"
+            range 0 1
+            default 0
+        config IPPHONE_BUTTON_DEBOUNCE_MS
+            int "Main button debounce time, ms"
+            default 40
+        config IPPHONE_BUTTON_HOLD_MS
+            int "Main button hold time for PTT, ms"
+            default 500
+    endmenu
 
     menu "Keypad pins"
         config IPPHONE_KEYPAD_ROW0
@@ -79,6 +91,21 @@ menu "ESP32 IPphone"
             int "Red voice activity LED active level"
             range 0 1
             default 1
+    endmenu
+
+    menu "microSD SPI pins"
+        config IPPHONE_SD_SCK_GPIO
+            int "microSD SPI SCK GPIO"
+            default 14
+        config IPPHONE_SD_MOSI_GPIO
+            int "microSD SPI MOSI GPIO"
+            default 13
+        config IPPHONE_SD_MISO_GPIO
+            int "microSD SPI MISO GPIO"
+            default 27
+        config IPPHONE_SD_CS_GPIO
+            int "microSD SPI CS GPIO"
+            default 32
     endmenu
 
 endmenu

@@ -1,6 +1,7 @@
 #include "network_audio.h"
 
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
@@ -15,6 +16,7 @@
 #include "esp_wifi.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
+#include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "nvs_flash.h"
 #include "status_leds.h"
@@ -26,9 +28,12 @@ static const char *TAG = "network_audio";
 #define NETWORK_AUDIO_QUEUE_LEN 32
 #define NETWORK_AUDIO_SAMPLES_PER_PACKET 96
 #define NETWORK_AUDIO_DEFAULT_RECORD_MS 3000
+#define NETWORK_AUDIO_SEND_TIMEOUT_MS 100
+#define NETWORK_AUDIO_BUSY_LOG_MS 1000
 
 #define NETWORK_AUDIO_FLAG_START 0x01
 #define NETWORK_AUDIO_FLAG_END 0x02
+#define NETWORK_AUDIO_PACKET_HEADER_SIZE offsetof(network_audio_packet_t, samples)
 
 typedef struct {
     uint32_t magic;
@@ -42,12 +47,42 @@ typedef struct {
 
 static const uint8_t s_broadcast_mac[ESP_NOW_ETH_ALEN] = {0xff, 0xff, 0xff, 0xff, 0xff, 0xff};
 static QueueHandle_t s_rx_queue;
+static SemaphoreHandle_t s_tx_mutex;
+static SemaphoreHandle_t s_stream_mutex;
+static SemaphoreHandle_t s_send_done_sem;
+static esp_now_send_status_t s_last_send_status;
+static portMUX_TYPE s_rx_drop_mux = portMUX_INITIALIZER_UNLOCKED;
+static uint32_t s_rx_queue_drops;
 static bool s_streaming_tx;
 static bool s_streaming_tx_first_packet;
 static uint16_t s_streaming_tx_sequence;
+static TaskHandle_t s_streaming_tx_owner;
+
+static esp_err_t network_audio_stop_rx_speaker(bool *speaker_started, const char *reason)
+{
+    if (!*speaker_started) {
+        return ESP_OK;
+    }
+
+    esp_err_t stop_err = audio_speaker_stop();
+    if (stop_err != ESP_OK) {
+        ESP_LOGE(TAG, "%s: stop speaker failed: %s", reason, esp_err_to_name(stop_err));
+        return stop_err;
+    }
+
+    *speaker_started = false;
+    status_leds_set_rx(false);
+    return ESP_OK;
+}
 
 static esp_err_t network_audio_send_packet(const int16_t *samples, uint8_t sample_count, uint8_t flags, uint16_t sequence)
 {
+    ESP_RETURN_ON_FALSE(s_tx_mutex != NULL, ESP_ERR_INVALID_STATE, TAG, "tx mutex is not initialized");
+    ESP_RETURN_ON_FALSE(xSemaphoreTake(s_tx_mutex, pdMS_TO_TICKS(NETWORK_AUDIO_SEND_TIMEOUT_MS)) == pdTRUE,
+                        ESP_ERR_TIMEOUT,
+                        TAG,
+                        "tx mutex timeout");
+
     network_audio_packet_t packet = {
         .magic = NETWORK_AUDIO_MAGIC,
         .version = NETWORK_AUDIO_VERSION,
@@ -60,25 +95,79 @@ static esp_err_t network_audio_send_packet(const int16_t *samples, uint8_t sampl
         memcpy(packet.samples, samples, sample_count * sizeof(packet.samples[0]));
     }
 
-    return esp_now_send(s_broadcast_mac, (const uint8_t *)&packet, sizeof(packet));
+    const size_t packet_size = NETWORK_AUDIO_PACKET_HEADER_SIZE + sample_count * sizeof(packet.samples[0]);
+    if (s_send_done_sem != NULL) {
+        while (xSemaphoreTake(s_send_done_sem, 0) == pdTRUE) {
+        }
+        s_last_send_status = ESP_NOW_SEND_FAIL;
+    }
+    esp_err_t err = esp_now_send(s_broadcast_mac, (const uint8_t *)&packet, packet_size);
+    if (err != ESP_OK) {
+        xSemaphoreGive(s_tx_mutex);
+        ESP_RETURN_ON_ERROR(err, TAG, "esp-now send failed");
+    }
+
+    if (s_send_done_sem != NULL) {
+        if (xSemaphoreTake(s_send_done_sem, pdMS_TO_TICKS(NETWORK_AUDIO_SEND_TIMEOUT_MS)) != pdTRUE) {
+            ESP_LOGW(TAG, "esp-now send callback timeout");
+            xSemaphoreGive(s_tx_mutex);
+            return ESP_ERR_TIMEOUT;
+        }
+        if (s_last_send_status != ESP_NOW_SEND_SUCCESS) {
+            ESP_LOGW(TAG, "esp-now send status failed: %d", s_last_send_status);
+            xSemaphoreGive(s_tx_mutex);
+            return ESP_FAIL;
+        }
+    }
+
+    xSemaphoreGive(s_tx_mutex);
+    return ESP_OK;
+}
+
+static void network_audio_send_cb(const wifi_tx_info_t *tx_info, esp_now_send_status_t status)
+{
+    (void)tx_info;
+    s_last_send_status = status;
+    if (s_send_done_sem != NULL) {
+        xSemaphoreGive(s_send_done_sem);
+    }
 }
 
 static void network_audio_recv_cb(const esp_now_recv_info_t *recv_info, const uint8_t *data, int data_len)
 {
     (void)recv_info;
 
-    if (data == NULL || data_len != sizeof(network_audio_packet_t) || s_rx_queue == NULL) {
+    if (data == NULL || data_len < (int)NETWORK_AUDIO_PACKET_HEADER_SIZE || data_len > (int)sizeof(network_audio_packet_t) ||
+        s_rx_queue == NULL) {
         return;
     }
 
-    network_audio_packet_t packet;
-    memcpy(&packet, data, sizeof(packet));
+    network_audio_packet_t packet = {0};
+    memcpy(&packet, data, data_len);
     if (packet.magic != NETWORK_AUDIO_MAGIC || packet.version != NETWORK_AUDIO_VERSION ||
         packet.sample_count > NETWORK_AUDIO_SAMPLES_PER_PACKET) {
         return;
     }
+    const int expected_len = (int)(NETWORK_AUDIO_PACKET_HEADER_SIZE + packet.sample_count * sizeof(packet.samples[0]));
+    if (data_len != expected_len) {
+        return;
+    }
 
-    (void)xQueueSend(s_rx_queue, &packet, 0);
+    if (xQueueSend(s_rx_queue, &packet, 0) != pdTRUE) {
+        portENTER_CRITICAL(&s_rx_drop_mux);
+        ++s_rx_queue_drops;
+        portEXIT_CRITICAL(&s_rx_drop_mux);
+    }
+}
+
+static void log_busy_limited(const char *message, esp_err_t err)
+{
+    static TickType_t s_next_log_tick;
+    TickType_t now = xTaskGetTickCount();
+    if (now >= s_next_log_tick) {
+        ESP_LOGW(TAG, "%s: %s", message, esp_err_to_name(err));
+        s_next_log_tick = now + pdMS_TO_TICKS(NETWORK_AUDIO_BUSY_LOG_MS);
+    }
 }
 
 static void network_audio_rx_task(void *arg)
@@ -86,42 +175,79 @@ static void network_audio_rx_task(void *arg)
     (void)arg;
 
     bool speaker_started = false;
+    bool dropping_stream = false;
+    uint16_t expected_sequence = 0;
     network_audio_packet_t packet;
 
     while (true) {
         if (xQueueReceive(s_rx_queue, &packet, pdMS_TO_TICKS(250)) != pdTRUE) {
+            uint32_t queue_drops = 0;
+            portENTER_CRITICAL(&s_rx_drop_mux);
+            queue_drops = s_rx_queue_drops;
+            s_rx_queue_drops = 0;
+            portEXIT_CRITICAL(&s_rx_drop_mux);
+            if (queue_drops > 0) {
+                ESP_LOGW(TAG, "ESP-NOW RX queue drops=%lu", (unsigned long)queue_drops);
+            }
             if (speaker_started) {
-                audio_speaker_stop();
-                speaker_started = false;
-                status_leds_set_rx(false);
-                ESP_LOGW(TAG, "receive timeout, speaker stopped");
+                if (network_audio_stop_rx_speaker(&speaker_started, "receive timeout") == ESP_OK) {
+                    ESP_LOGW(TAG, "receive timeout, speaker stopped");
+                }
+            }
+            dropping_stream = false;
+            continue;
+        }
+
+        if (dropping_stream) {
+            if ((packet.flags & NETWORK_AUDIO_FLAG_END) != 0) {
+                dropping_stream = false;
             }
             continue;
         }
 
         if ((packet.flags & NETWORK_AUDIO_FLAG_START) != 0) {
             if (speaker_started) {
-                audio_speaker_stop();
+                if (network_audio_stop_rx_speaker(&speaker_started, "restart speaker") != ESP_OK) {
+                    dropping_stream = true;
+                    continue;
+                }
             }
-            ESP_ERROR_CHECK(audio_speaker_start());
+            esp_err_t start_err = audio_speaker_start();
+            if (start_err != ESP_OK) {
+                log_busy_limited("incoming voice dropped, speaker busy", start_err);
+                status_leds_set_rx(false);
+                dropping_stream = true;
+                continue;
+            }
             speaker_started = true;
+            expected_sequence = packet.sequence;
             status_leds_set_rx(true);
             ESP_LOGI(TAG, "incoming voice started");
         } else if (!speaker_started) {
-            ESP_ERROR_CHECK(audio_speaker_start());
-            speaker_started = true;
-            status_leds_set_rx(true);
+            continue;
         }
 
+        if (packet.sequence != expected_sequence) {
+            ESP_LOGW(TAG,
+                     "incoming voice sequence gap: expected=%u got=%u",
+                     (unsigned)expected_sequence,
+                     (unsigned)packet.sequence);
+        }
+        expected_sequence = packet.sequence + 1;
+
         if (packet.sample_count > 0) {
-            ESP_ERROR_CHECK(audio_speaker_write(packet.samples, packet.sample_count));
+            esp_err_t write_err = audio_speaker_write(packet.samples, packet.sample_count);
+            if (write_err != ESP_OK) {
+                ESP_LOGE(TAG, "incoming voice write failed: %s", esp_err_to_name(write_err));
+                (void)network_audio_stop_rx_speaker(&speaker_started, "write error");
+                continue;
+            }
         }
 
         if ((packet.flags & NETWORK_AUDIO_FLAG_END) != 0) {
-            ESP_ERROR_CHECK(audio_speaker_stop());
-            speaker_started = false;
-            status_leds_set_rx(false);
-            ESP_LOGI(TAG, "incoming voice finished");
+            if (network_audio_stop_rx_speaker(&speaker_started, "incoming voice end") == ESP_OK) {
+                ESP_LOGI(TAG, "incoming voice finished");
+            }
         }
     }
 }
@@ -160,10 +286,17 @@ esp_err_t network_audio_init(void)
 {
     s_rx_queue = xQueueCreate(NETWORK_AUDIO_QUEUE_LEN, sizeof(network_audio_packet_t));
     ESP_RETURN_ON_FALSE(s_rx_queue != NULL, ESP_ERR_NO_MEM, TAG, "create rx queue failed");
+    s_tx_mutex = xSemaphoreCreateMutex();
+    ESP_RETURN_ON_FALSE(s_tx_mutex != NULL, ESP_ERR_NO_MEM, TAG, "create tx mutex failed");
+    s_stream_mutex = xSemaphoreCreateMutex();
+    ESP_RETURN_ON_FALSE(s_stream_mutex != NULL, ESP_ERR_NO_MEM, TAG, "create stream mutex failed");
+    s_send_done_sem = xSemaphoreCreateBinary();
+    ESP_RETURN_ON_FALSE(s_send_done_sem != NULL, ESP_ERR_NO_MEM, TAG, "create send semaphore failed");
 
     ESP_RETURN_ON_ERROR(network_audio_init_wifi(), TAG, "wifi init failed");
     ESP_RETURN_ON_ERROR(esp_now_init(), TAG, "esp-now init failed");
     ESP_RETURN_ON_ERROR(esp_now_register_recv_cb(network_audio_recv_cb), TAG, "register recv cb failed");
+    ESP_RETURN_ON_ERROR(esp_now_register_send_cb(network_audio_send_cb), TAG, "register send cb failed");
 
     esp_now_peer_info_t peer = {
         .channel = 1,
@@ -245,14 +378,28 @@ esp_err_t network_audio_send_recording(uint32_t duration_ms)
 
 esp_err_t network_audio_stream_start(void)
 {
-    ESP_RETURN_ON_FALSE(!s_streaming_tx, ESP_ERR_INVALID_STATE, TAG, "stream tx is already running");
+    ESP_RETURN_ON_FALSE(s_stream_mutex != NULL, ESP_ERR_INVALID_STATE, TAG, "stream mutex is not initialized");
+    ESP_RETURN_ON_FALSE(xSemaphoreTake(s_stream_mutex, pdMS_TO_TICKS(NETWORK_AUDIO_SEND_TIMEOUT_MS)) == pdTRUE,
+                        ESP_ERR_TIMEOUT,
+                        TAG,
+                        "stream mutex timeout");
+    if (s_streaming_tx) {
+        xSemaphoreGive(s_stream_mutex);
+        ESP_LOGE(TAG, "stream tx is already running");
+        return ESP_ERR_INVALID_STATE;
+    }
 
     esp_err_t err = audio_mic_start();
-    ESP_RETURN_ON_ERROR(err, TAG, "start live mic failed");
+    if (err != ESP_OK) {
+        xSemaphoreGive(s_stream_mutex);
+        ESP_RETURN_ON_ERROR(err, TAG, "start live mic failed");
+    }
 
     s_streaming_tx = true;
     s_streaming_tx_first_packet = true;
     s_streaming_tx_sequence = 0;
+    s_streaming_tx_owner = xTaskGetCurrentTaskHandle();
+    xSemaphoreGive(s_stream_mutex);
     status_leds_set_tx(true);
     ESP_LOGI(TAG, "live voice stream started");
     return ESP_OK;
@@ -260,13 +407,24 @@ esp_err_t network_audio_stream_start(void)
 
 esp_err_t network_audio_stream_send_next(bool end_after_packet)
 {
-    ESP_RETURN_ON_FALSE(s_streaming_tx, ESP_ERR_INVALID_STATE, TAG, "stream tx is not running");
+    ESP_RETURN_ON_FALSE(s_stream_mutex != NULL, ESP_ERR_INVALID_STATE, TAG, "stream mutex is not initialized");
+    ESP_RETURN_ON_FALSE(xSemaphoreTake(s_stream_mutex, pdMS_TO_TICKS(NETWORK_AUDIO_SEND_TIMEOUT_MS)) == pdTRUE,
+                        ESP_ERR_TIMEOUT,
+                        TAG,
+                        "stream mutex timeout");
+    if (!s_streaming_tx || s_streaming_tx_owner != xTaskGetCurrentTaskHandle()) {
+        xSemaphoreGive(s_stream_mutex);
+        return ESP_ERR_INVALID_STATE;
+    }
 
     int16_t samples[NETWORK_AUDIO_SAMPLES_PER_PACKET] = {0};
     size_t samples_read = 0;
     int32_t peak = 0;
     esp_err_t err = audio_mic_read(samples, NETWORK_AUDIO_SAMPLES_PER_PACKET, &samples_read, &peak);
-    ESP_RETURN_ON_ERROR(err, TAG, "read live mic failed");
+    if (err != ESP_OK) {
+        xSemaphoreGive(s_stream_mutex);
+        ESP_RETURN_ON_ERROR(err, TAG, "read live mic failed");
+    }
 
     uint8_t flags = 0;
     if (s_streaming_tx_first_packet) {
@@ -278,22 +436,40 @@ esp_err_t network_audio_stream_send_next(bool end_after_packet)
     }
 
     err = network_audio_send_packet(samples, (uint8_t)samples_read, flags, s_streaming_tx_sequence++);
-    ESP_RETURN_ON_ERROR(err, TAG, "send live packet failed");
-
-    if (end_after_packet) {
-        ESP_RETURN_ON_ERROR(audio_mic_stop(), TAG, "stop live mic failed");
-        s_streaming_tx = false;
-        status_leds_set_tx(false);
-        ESP_LOGI(TAG, "live voice stream stopped, last peak=%ld", peak);
+    if (err != ESP_OK) {
+        xSemaphoreGive(s_stream_mutex);
+        ESP_RETURN_ON_ERROR(err, TAG, "send live packet failed");
     }
 
+    if (end_after_packet) {
+        esp_err_t stop_err = audio_mic_stop();
+        s_streaming_tx = false;
+        s_streaming_tx_owner = NULL;
+        status_leds_set_tx(false);
+        xSemaphoreGive(s_stream_mutex);
+        ESP_RETURN_ON_ERROR(stop_err, TAG, "stop live mic failed");
+        ESP_LOGI(TAG, "live voice stream stopped, last peak=%ld", peak);
+        return ESP_OK;
+    }
+
+    xSemaphoreGive(s_stream_mutex);
     return ESP_OK;
 }
 
 esp_err_t network_audio_stream_stop(void)
 {
+    ESP_RETURN_ON_FALSE(s_stream_mutex != NULL, ESP_ERR_INVALID_STATE, TAG, "stream mutex is not initialized");
+    ESP_RETURN_ON_FALSE(xSemaphoreTake(s_stream_mutex, pdMS_TO_TICKS(NETWORK_AUDIO_SEND_TIMEOUT_MS)) == pdTRUE,
+                        ESP_ERR_TIMEOUT,
+                        TAG,
+                        "stream mutex timeout");
     if (!s_streaming_tx) {
+        xSemaphoreGive(s_stream_mutex);
         return ESP_OK;
+    }
+    if (s_streaming_tx_owner != xTaskGetCurrentTaskHandle()) {
+        xSemaphoreGive(s_stream_mutex);
+        return ESP_ERR_INVALID_STATE;
     }
 
     int16_t zero_sample = 0;
@@ -306,7 +482,9 @@ esp_err_t network_audio_stream_stop(void)
     esp_err_t mic_err = audio_mic_stop();
     s_streaming_tx = false;
     s_streaming_tx_first_packet = false;
+    s_streaming_tx_owner = NULL;
     status_leds_set_tx(false);
+    xSemaphoreGive(s_stream_mutex);
 
     ESP_RETURN_ON_ERROR(mic_err, TAG, "stop live mic failed");
     ESP_RETURN_ON_ERROR(send_err, TAG, "send live end packet failed");
