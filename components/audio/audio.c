@@ -9,13 +9,19 @@
 #include "esp_check.h"
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
 #include "freertos/task.h"
 
 static const char *TAG = "audio";
 
 static i2s_chan_handle_t s_mic_rx_chan;
 static i2s_chan_handle_t s_spk_tx_chan;
+static SemaphoreHandle_t s_mic_mutex;
+static SemaphoreHandle_t s_speaker_mutex;
+static TaskHandle_t s_mic_owner;
+static TaskHandle_t s_speaker_owner;
 static bool s_audio_busy;
+static bool s_speaker_busy;
 
 #define MIC_READ_SAMPLES 256
 #define SPEAKER_TONE_HZ 880
@@ -48,6 +54,7 @@ static esp_err_t speaker_write_samples(const int16_t *samples, size_t sample_cou
             i2s_channel_write(s_spk_tx_chan, data, bytes_remaining, &bytes_written, pdMS_TO_TICKS(1000)),
             TAG,
             "speaker write failed");
+        ESP_RETURN_ON_FALSE(bytes_written > 0, ESP_ERR_TIMEOUT, TAG, "speaker write made no progress");
         data += bytes_written;
         bytes_remaining -= bytes_written;
     }
@@ -55,8 +62,25 @@ static esp_err_t speaker_write_samples(const int16_t *samples, size_t sample_cou
     return ESP_OK;
 }
 
+static bool current_task_owns_mic(void)
+{
+    return s_mic_owner == xTaskGetCurrentTaskHandle();
+}
+
+static bool current_task_owns_speaker(void)
+{
+    return s_speaker_owner == xTaskGetCurrentTaskHandle();
+}
+
 esp_err_t audio_init(void)
 {
+    s_mic_mutex = xSemaphoreCreateMutex();
+    s_speaker_mutex = xSemaphoreCreateMutex();
+    ESP_RETURN_ON_FALSE(s_mic_mutex != NULL && s_speaker_mutex != NULL,
+                        ESP_ERR_NO_MEM,
+                        TAG,
+                        "create audio mutexes failed");
+
     ESP_LOGI(TAG,
              "I2S mic: BCLK=%d WS=%d DIN=%d; speaker: BCLK=%d WS=%d DOUT=%d; sample_rate=%d",
              CONFIG_IPPHONE_I2S_MIC_BCLK,
@@ -126,12 +150,13 @@ esp_err_t audio_play_test_tone(void)
     ESP_RETURN_ON_FALSE(s_spk_tx_chan != NULL, ESP_ERR_INVALID_STATE, TAG, "speaker tx channel is not initialized");
 
     ESP_LOGI(TAG, "playing %d Hz test tone for %d ms", SPEAKER_TONE_HZ, SPEAKER_TONE_MS);
-    ESP_RETURN_ON_ERROR(i2s_channel_enable(s_spk_tx_chan), TAG, "enable speaker tx failed");
+    ESP_RETURN_ON_ERROR(audio_speaker_start(), TAG, "enable speaker tx failed");
 
     const int sample_rate = CONFIG_IPPHONE_I2S_SAMPLE_RATE;
     const int total_samples = (sample_rate * SPEAKER_TONE_MS) / 1000;
     int16_t samples[128] = {0};
     int samples_written = 0;
+    esp_err_t err = ESP_OK;
 
     while (samples_written < total_samples) {
         const int max_batch = (int)(sizeof(samples) / sizeof(samples[0]));
@@ -143,23 +168,27 @@ esp_err_t audio_play_test_tone(void)
         }
 
         size_t bytes_written = 0;
-        ESP_RETURN_ON_ERROR(
-            i2s_channel_write(s_spk_tx_chan, samples, batch * sizeof(samples[0]), &bytes_written, pdMS_TO_TICKS(1000)),
-            TAG,
-            "write speaker tone failed");
+        err = i2s_channel_write(s_spk_tx_chan, samples, batch * sizeof(samples[0]), &bytes_written, pdMS_TO_TICKS(1000));
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "write speaker tone failed: %s", esp_err_to_name(err));
+            break;
+        }
+        if (bytes_written == 0) {
+            err = ESP_ERR_TIMEOUT;
+            ESP_LOGE(TAG, "speaker tone write made no progress");
+            break;
+        }
         samples_written += bytes_written / sizeof(samples[0]);
     }
 
-    i2s_channel_disable(s_spk_tx_chan);
-    return ESP_OK;
+    esp_err_t stop_err = audio_speaker_stop();
+    return err == ESP_OK ? stop_err : err;
 }
 
 esp_err_t audio_record_and_playback_test(uint32_t duration_ms)
 {
     ESP_RETURN_ON_FALSE(s_mic_rx_chan != NULL, ESP_ERR_INVALID_STATE, TAG, "mic rx channel is not initialized");
     ESP_RETURN_ON_FALSE(s_spk_tx_chan != NULL, ESP_ERR_INVALID_STATE, TAG, "speaker tx channel is not initialized");
-    ESP_RETURN_ON_FALSE(!s_audio_busy, ESP_ERR_INVALID_STATE, TAG, "audio is busy");
-
     if (duration_ms == 0) {
         duration_ms = RECORD_PLAYBACK_MS;
     }
@@ -206,6 +235,11 @@ esp_err_t audio_record_samples(int16_t *samples, size_t sample_count, int32_t *p
         if (err != ESP_OK) {
             break;
         }
+        if (samples_read == 0) {
+            err = ESP_ERR_TIMEOUT;
+            ESP_LOGE(TAG, "mic read made no progress");
+            break;
+        }
 
         samples_recorded += samples_read;
         if (chunk_peak > local_peak) {
@@ -244,12 +278,16 @@ esp_err_t audio_play_samples(const int16_t *samples, size_t sample_count)
 esp_err_t audio_mic_start(void)
 {
     ESP_RETURN_ON_FALSE(s_mic_rx_chan != NULL, ESP_ERR_INVALID_STATE, TAG, "mic rx channel is not initialized");
-    ESP_RETURN_ON_FALSE(!s_audio_busy, ESP_ERR_INVALID_STATE, TAG, "audio is busy");
+    ESP_RETURN_ON_FALSE(s_mic_mutex != NULL, ESP_ERR_INVALID_STATE, TAG, "mic mutex is not initialized");
+    ESP_RETURN_ON_FALSE(xSemaphoreTake(s_mic_mutex, 0) == pdTRUE, ESP_ERR_INVALID_STATE, TAG, "mic is busy");
 
     s_audio_busy = true;
+    s_mic_owner = xTaskGetCurrentTaskHandle();
     esp_err_t err = i2s_channel_enable(s_mic_rx_chan);
     if (err != ESP_OK) {
         s_audio_busy = false;
+        s_mic_owner = NULL;
+        xSemaphoreGive(s_mic_mutex);
         ESP_LOGE(TAG, "enable mic rx failed: %s", esp_err_to_name(err));
     }
     return err;
@@ -260,6 +298,7 @@ esp_err_t audio_mic_read(int16_t *samples, size_t sample_capacity, size_t *sampl
     ESP_RETURN_ON_FALSE(samples != NULL, ESP_ERR_INVALID_ARG, TAG, "mic samples buffer is null");
     ESP_RETURN_ON_FALSE(sample_capacity > 0, ESP_ERR_INVALID_ARG, TAG, "mic samples capacity is zero");
     ESP_RETURN_ON_FALSE(s_audio_busy, ESP_ERR_INVALID_STATE, TAG, "mic is not started");
+    ESP_RETURN_ON_FALSE(current_task_owns_mic(), ESP_ERR_INVALID_STATE, TAG, "mic is owned by another task");
 
     int32_t mic_chunk[MIC_READ_SAMPLES] = {0};
     const size_t samples_to_read = sample_capacity < MIC_READ_SAMPLES ? sample_capacity : MIC_READ_SAMPLES;
@@ -270,6 +309,7 @@ esp_err_t audio_mic_read(int16_t *samples, size_t sample_capacity, size_t *sampl
     ESP_RETURN_ON_ERROR(err, TAG, "mic read failed");
 
     const size_t read_count = bytes_read / sizeof(mic_chunk[0]);
+    ESP_RETURN_ON_FALSE(read_count > 0, ESP_ERR_TIMEOUT, TAG, "mic read made no progress");
     int32_t local_peak = 0;
     for (size_t i = 0; i < read_count; ++i) {
         const int16_t sample = mic_sample_to_speaker_sample(mic_chunk[i]);
@@ -293,30 +333,61 @@ esp_err_t audio_mic_stop(void)
 {
     ESP_RETURN_ON_FALSE(s_mic_rx_chan != NULL, ESP_ERR_INVALID_STATE, TAG, "mic rx channel is not initialized");
     ESP_RETURN_ON_FALSE(s_audio_busy, ESP_ERR_INVALID_STATE, TAG, "mic is not started");
+    ESP_RETURN_ON_FALSE(current_task_owns_mic(), ESP_ERR_INVALID_STATE, TAG, "mic is owned by another task");
 
     esp_err_t err = i2s_channel_disable(s_mic_rx_chan);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "disable mic rx failed: %s", esp_err_to_name(err));
+    }
+
     s_audio_busy = false;
+    s_mic_owner = NULL;
+    xSemaphoreGive(s_mic_mutex);
     return err;
 }
 
 esp_err_t audio_speaker_start(void)
 {
     ESP_RETURN_ON_FALSE(s_spk_tx_chan != NULL, ESP_ERR_INVALID_STATE, TAG, "speaker tx channel is not initialized");
+    ESP_RETURN_ON_FALSE(s_speaker_mutex != NULL, ESP_ERR_INVALID_STATE, TAG, "speaker mutex is not initialized");
+    ESP_RETURN_ON_FALSE(xSemaphoreTake(s_speaker_mutex, 0) == pdTRUE,
+                        ESP_ERR_INVALID_STATE,
+                        TAG,
+                        "speaker is busy");
+
     esp_err_t err = i2s_channel_enable(s_spk_tx_chan);
     if (err != ESP_OK) {
+        xSemaphoreGive(s_speaker_mutex);
         ESP_LOGE(TAG, "enable speaker tx failed: %s", esp_err_to_name(err));
+        return err;
     }
-    return err;
+
+    s_speaker_busy = true;
+    s_speaker_owner = xTaskGetCurrentTaskHandle();
+    return ESP_OK;
 }
 
 esp_err_t audio_speaker_write(const int16_t *samples, size_t sample_count)
 {
     ESP_RETURN_ON_FALSE(samples != NULL, ESP_ERR_INVALID_ARG, TAG, "speaker samples buffer is null");
+    ESP_RETURN_ON_FALSE(s_speaker_busy, ESP_ERR_INVALID_STATE, TAG, "speaker is not started");
+    ESP_RETURN_ON_FALSE(current_task_owns_speaker(), ESP_ERR_INVALID_STATE, TAG, "speaker is owned by another task");
     return speaker_write_samples(samples, sample_count);
 }
 
 esp_err_t audio_speaker_stop(void)
 {
     ESP_RETURN_ON_FALSE(s_spk_tx_chan != NULL, ESP_ERR_INVALID_STATE, TAG, "speaker tx channel is not initialized");
-    return i2s_channel_disable(s_spk_tx_chan);
+    ESP_RETURN_ON_FALSE(s_speaker_busy, ESP_ERR_INVALID_STATE, TAG, "speaker is not started");
+    ESP_RETURN_ON_FALSE(current_task_owns_speaker(), ESP_ERR_INVALID_STATE, TAG, "speaker is owned by another task");
+
+    esp_err_t err = i2s_channel_disable(s_spk_tx_chan);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "disable speaker tx failed: %s", esp_err_to_name(err));
+    }
+
+    s_speaker_busy = false;
+    s_speaker_owner = NULL;
+    xSemaphoreGive(s_speaker_mutex);
+    return err;
 }
