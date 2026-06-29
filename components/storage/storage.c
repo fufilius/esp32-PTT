@@ -6,6 +6,7 @@
 #include <string.h>
 
 #include "audio.h"
+#include "driver/gpio.h"
 #include "driver/sdspi_host.h"
 #include "driver/spi_common.h"
 #include "esp_check.h"
@@ -24,6 +25,8 @@ static const char *TAG = "storage";
 #define WAV_HEADER_SIZE 44
 #define STORAGE_RECORD_STOP_TIMEOUT_MS 2000
 #define STORAGE_RECORD_PROGRESS_TIMEOUT_MS 3000
+#define STORAGE_SD_MOUNT_RETRIES 5
+#define STORAGE_SD_MOUNT_RETRY_DELAY_MS 500
 
 typedef enum {
     RECORD_STATE_IDLE,
@@ -122,6 +125,25 @@ static esp_err_t record_chunk_to_sd(FILE *file, uint32_t *recorded_bytes)
     }
 
     return ESP_OK;
+}
+
+static void configure_sd_spi_pullups(void)
+{
+    gpio_set_pull_mode(CONFIG_IPPHONE_SD_MISO_GPIO, GPIO_PULLUP_ONLY);
+    gpio_set_pull_mode(CONFIG_IPPHONE_SD_MOSI_GPIO, GPIO_PULLUP_ONLY);
+    gpio_set_pull_mode(CONFIG_IPPHONE_SD_SCK_GPIO, GPIO_PULLUP_ONLY);
+    gpio_set_pull_mode(CONFIG_IPPHONE_SD_CS_GPIO, GPIO_PULLUP_ONLY);
+}
+
+static void log_sd_wiring_hint(void)
+{
+    ESP_LOGE(TAG,
+             "Check microSD wiring: VCC=5V for AMS1117 modules or 3V3 for bare sockets, GND=GND, "
+             "SCK=GPIO%d, MOSI=GPIO%d, MISO=GPIO%d, CS=GPIO%d",
+             CONFIG_IPPHONE_SD_SCK_GPIO,
+             CONFIG_IPPHONE_SD_MOSI_GPIO,
+             CONFIG_IPPHONE_SD_MISO_GPIO,
+             CONFIG_IPPHONE_SD_CS_GPIO);
 }
 
 static bool record_stop_requested(void)
@@ -256,6 +278,7 @@ esp_err_t storage_init(void)
 
     sdmmc_host_t host = SDSPI_HOST_DEFAULT();
     host.slot = SPI2_HOST;
+    host.max_freq_khz = CONFIG_IPPHONE_SD_SPI_FREQ_KHZ;
 
     spi_bus_config_t bus_cfg = {
         .mosi_io_num = CONFIG_IPPHONE_SD_MOSI_GPIO,
@@ -266,6 +289,8 @@ esp_err_t storage_init(void)
         .max_transfer_sz = 4096,
     };
 
+    configure_sd_spi_pullups();
+
     esp_err_t err = spi_bus_initialize(host.slot, &bus_cfg, SDSPI_DEFAULT_DMA);
     ESP_RETURN_ON_ERROR(err, TAG, "sd spi bus init failed");
 
@@ -273,17 +298,38 @@ esp_err_t storage_init(void)
     slot_config.gpio_cs = CONFIG_IPPHONE_SD_CS_GPIO;
     slot_config.host_id = host.slot;
 
-    err = esp_vfs_fat_sdspi_mount(STORAGE_MOUNT_POINT, &host, &slot_config, &mount_config, &s_card);
-    if (err != ESP_OK) {
-        spi_bus_free(host.slot);
-        ESP_LOGE(TAG, "mount microSD failed: %s", esp_err_to_name(err));
-        return err;
+    ESP_LOGI(TAG,
+             "mounting microSD over SPI: SCK=%d MOSI=%d MISO=%d CS=%d freq=%d kHz",
+             CONFIG_IPPHONE_SD_SCK_GPIO,
+             CONFIG_IPPHONE_SD_MOSI_GPIO,
+             CONFIG_IPPHONE_SD_MISO_GPIO,
+             CONFIG_IPPHONE_SD_CS_GPIO,
+             CONFIG_IPPHONE_SD_SPI_FREQ_KHZ);
+
+    err = ESP_FAIL;
+    for (int attempt = 1; attempt <= STORAGE_SD_MOUNT_RETRIES; ++attempt) {
+        err = esp_vfs_fat_sdspi_mount(STORAGE_MOUNT_POINT, &host, &slot_config, &mount_config, &s_card);
+        if (err == ESP_OK) {
+            s_mounted = true;
+            sdmmc_card_print_info(stdout, s_card);
+            ESP_LOGI(TAG, "microSD mounted at %s", STORAGE_MOUNT_POINT);
+            return ESP_OK;
+        }
+
+        ESP_LOGW(TAG,
+                 "mount microSD attempt %d/%d failed: %s",
+                 attempt,
+                 STORAGE_SD_MOUNT_RETRIES,
+                 esp_err_to_name(err));
+        if (attempt < STORAGE_SD_MOUNT_RETRIES) {
+            vTaskDelay(pdMS_TO_TICKS(STORAGE_SD_MOUNT_RETRY_DELAY_MS));
+        }
     }
 
-    s_mounted = true;
-    sdmmc_card_print_info(stdout, s_card);
-    ESP_LOGI(TAG, "microSD mounted at %s", STORAGE_MOUNT_POINT);
-    return ESP_OK;
+    spi_bus_free(host.slot);
+    ESP_LOGE(TAG, "mount microSD failed after %d attempts: %s", STORAGE_SD_MOUNT_RETRIES, esp_err_to_name(err));
+    log_sd_wiring_hint();
+    return err;
 }
 
 bool storage_record_is_active(void)
