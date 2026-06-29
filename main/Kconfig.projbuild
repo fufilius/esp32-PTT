@@ -3,7 +3,7 @@ menu "ESP32 IPphone"
     menu "Main button"
         config IPPHONE_BUTTON_GPIO
             int "Main button GPIO"
-            default 0
+            default 25
         config IPPHONE_BUTTON_ACTIVE_LEVEL
             int "Main button active level"
             range 0 1
@@ -106,6 +106,10 @@ menu "ESP32 IPphone"
         config IPPHONE_SD_CS_GPIO
             int "microSD SPI CS GPIO"
             default 32
+        config IPPHONE_SD_SPI_FREQ_KHZ
+            int "microSD SPI frequency (kHz)"
+            range 400 20000
+            default 400
     endmenu
 
 endmenu
