@@ -27,6 +27,7 @@ static const char *TAG = "storage";
 #define STORAGE_RECORD_PROGRESS_TIMEOUT_MS 3000
 #define STORAGE_SD_MOUNT_RETRIES 5
 #define STORAGE_SD_MOUNT_RETRY_DELAY_MS 500
+#define STORAGE_PLAYBACK_GAIN_Q8 192
 
 typedef enum {
     RECORD_STATE_IDLE,
@@ -106,13 +107,36 @@ static esp_err_t rewrite_wav_header(FILE *file, uint32_t data_size)
     return ESP_OK;
 }
 
-static esp_err_t record_chunk_to_sd(FILE *file, uint32_t *recorded_bytes)
+static void scale_playback_samples(int16_t *samples, size_t sample_count)
+{
+    for (size_t i = 0; i < sample_count; ++i) {
+        samples[i] = (int16_t)(((int32_t)samples[i] * STORAGE_PLAYBACK_GAIN_Q8) >> 8);
+    }
+}
+
+static esp_err_t record_chunk_to_sd(FILE *file,
+                                    uint32_t *recorded_bytes,
+                                    int16_t *record_min,
+                                    int16_t *record_max,
+                                    int64_t *record_sum,
+                                    uint32_t *record_samples)
 {
     int16_t samples[STORAGE_RECORD_CHUNK_SAMPLES] = {0};
     size_t samples_read = 0;
     int32_t peak = 0;
     esp_err_t err = audio_mic_read(samples, STORAGE_RECORD_CHUNK_SAMPLES, &samples_read, &peak);
     ESP_RETURN_ON_ERROR(err, TAG, "read mic for sd failed");
+
+    for (size_t i = 0; i < samples_read; ++i) {
+        if (samples[i] < *record_min) {
+            *record_min = samples[i];
+        }
+        if (samples[i] > *record_max) {
+            *record_max = samples[i];
+        }
+        *record_sum += samples[i];
+    }
+    *record_samples += (uint32_t)samples_read;
 
     const size_t written = fwrite(samples, sizeof(samples[0]), samples_read, file);
     ESP_RETURN_ON_FALSE(written == samples_read, ESP_FAIL, TAG, "write recording failed: errno=%d", errno);
@@ -214,6 +238,10 @@ static void storage_record_task(void *arg)
     }
 
     uint32_t recorded_bytes = 0;
+    int16_t record_min = INT16_MAX;
+    int16_t record_max = INT16_MIN;
+    int64_t record_sum = 0;
+    uint32_t record_samples = 0;
     TaskHandle_t start_waiter = NULL;
     if (xSemaphoreTake(s_record_mutex, portMAX_DELAY) == pdTRUE) {
         if (s_record_start_cancel_requested) {
@@ -233,7 +261,7 @@ static void storage_record_task(void *arg)
     }
 
     while (!record_stop_requested()) {
-        err = record_chunk_to_sd(file, &recorded_bytes);
+        err = record_chunk_to_sd(file, &recorded_bytes, &record_min, &record_max, &record_sum, &record_samples);
         if (err != ESP_OK) {
             break;
         }
@@ -254,7 +282,14 @@ static void storage_record_task(void *arg)
     }
 
     if (err == ESP_OK) {
-        ESP_LOGI(TAG, "recording saved, bytes=%lu", (unsigned long)recorded_bytes);
+        const int32_t record_mean = record_samples > 0 ? (int32_t)(record_sum / record_samples) : 0;
+        ESP_LOGI(TAG,
+                 "recording saved, bytes=%lu, samples=%lu, min=%d, max=%d, mean=%ld",
+                 (unsigned long)recorded_bytes,
+                 (unsigned long)record_samples,
+                 (int)record_min,
+                 (int)record_max,
+                 (long)record_mean);
     } else {
         ESP_LOGE(TAG, "recording finished with error: %s", esp_err_to_name(err));
     }
@@ -512,6 +547,7 @@ esp_err_t storage_play_recording(void)
             break;
         }
 
+        scale_playback_samples(samples, samples_read);
         err = audio_speaker_write(samples, samples_read);
         if (err != ESP_OK) {
             break;
@@ -528,6 +564,6 @@ esp_err_t storage_play_recording(void)
     }
 
     ESP_RETURN_ON_ERROR(err, TAG, "play recording failed");
-    ESP_LOGI(TAG, "recording playback complete");
+    ESP_LOGI(TAG, "recording playback complete, playback_gain_q8=%d", STORAGE_PLAYBACK_GAIN_Q8);
     return ESP_OK;
 }

@@ -1,4 +1,4 @@
-﻿#include "audio.h"
+#include "audio.h"
 
 #include <math.h>
 #include <stdbool.h>
@@ -29,7 +29,7 @@ static bool s_speaker_busy;
 #define SPEAKER_AMPLITUDE 9000
 #define AUDIO_PI 3.14159265358979323846f
 #define RECORD_PLAYBACK_MS 3000
-#define MIC_TO_SPEAKER_SHIFT 12
+#define MIC_TO_SPEAKER_SHIFT 13
 
 static int16_t mic_sample_to_speaker_sample(int32_t mic_sample)
 {
@@ -96,7 +96,7 @@ esp_err_t audio_init(void)
 
     i2s_std_config_t mic_std_cfg = {
         .clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(CONFIG_IPPHONE_I2S_SAMPLE_RATE),
-        .slot_cfg = I2S_STD_MSB_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_32BIT, I2S_SLOT_MODE_MONO),
+        .slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_32BIT, I2S_SLOT_MODE_MONO),
         .gpio_cfg = {
             .mclk = I2S_GPIO_UNUSED,
             .bclk = CONFIG_IPPHONE_I2S_MIC_BCLK,
